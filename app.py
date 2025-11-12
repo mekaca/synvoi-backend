@@ -70,7 +70,7 @@ def load_model_safe():
         except Exception as e:
             print(f"[bootstrap] torch import edilemedi: {e}")
             model = None; model_ready = False; return
-        # Burada gerçek modeli yükleyin (placeholder):
+        # Burada gerçek modeli yükleyin (şimdilik placeholder):
         model = object()
         model_ready = True
         print("[bootstrap] model yüklendi (placeholder)")
@@ -80,25 +80,17 @@ def load_model_safe():
 
 app = Flask(__name__)
 
-# *** KRİTİK: Gunicorn altında modül import edilir edilmez modeli yükle ***
+# Gunicorn altında modül import edilince modeli yükle
 load_model_safe()
-
-# Emniyet kemeri: İlk istekte tekrar dener (gerekmezse hemen return olur)
-@app.before_first_request
-def _warmup():
-    global model_ready
-    if not model_ready:
-        print("[bootstrap] before_first_request: model tekrar yükleniyor…")
-        load_model_safe()
 
 @app.route("/", methods=["GET", "HEAD"])
 def root():
     return jsonify(status="ok", service=APP_NAME, model_ready=model_ready, model_file=os.path.basename(MODEL_LOCAL)), 200
 
-@app.route("/healthz")
+@app.route("/healthz", methods=["GET"])
 def healthz(): return "ok", 200
 
-@app.route("/version")
+@app.route("/version", methods=["GET"])
 def version():
     commit = os.getenv("RENDER_GIT_COMMIT", "")[:7]
     return jsonify(
@@ -116,9 +108,9 @@ def version():
 def infer():
     if not model_ready or model is None: return jsonify(error="Model not loaded"), 503
     data = request.get_json(silent=True) or {}
+    # result = run_inference(model, data)
     return jsonify(ok=True, detail="placeholder"), 200
 
 if __name__ == "__main__":
-    # Lokal çalıştırmada da çalışsın
     load_model_safe()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

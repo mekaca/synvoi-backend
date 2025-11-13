@@ -23,7 +23,6 @@ class MultiResolutionFeatureExtractor(nn.Module):
         super().__init__()
         self.sample_rate = sample_rate
         
-        # Multi-resolution Mel Spectrograms
         self.mel_512 = T.MelSpectrogram(
             sample_rate=sample_rate, n_fft=512, hop_length=128,
             n_mels=64, f_min=20, f_max=8000
@@ -32,8 +31,6 @@ class MultiResolutionFeatureExtractor(nn.Module):
             sample_rate=sample_rate, n_fft=1024, hop_length=256,
             n_mels=128, f_min=20, f_max=8000
         )
-        
-        # MFCC
         self.mfcc = T.MFCC(
             sample_rate=sample_rate, n_mfcc=n_mfcc,
             melkwargs={'n_fft': 1024, 'hop_length': 256, 'n_mels': 64}
@@ -41,8 +38,6 @@ class MultiResolutionFeatureExtractor(nn.Module):
 
     def forward(self, waveform):
         features = {}
-        
-        # Apply log compression
         mel_512 = torch.log1p(self.mel_512(waveform))
         mel_1024 = torch.log1p(self.mel_1024(waveform))
         mfcc = self.mfcc(waveform)
@@ -71,7 +66,6 @@ class ConformerBlock(nn.Module):
     def __init__(self, d_model, n_heads, conv_kernel_size=31, dropout=0.15):
         super().__init__()
         
-        # Feed-forward 1
         self.ff1 = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, 4 * d_model),
@@ -81,11 +75,9 @@ class ConformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Multi-head attention
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.attn_norm = nn.LayerNorm(d_model)
         
-        # Convolution module
         self.conv_norm = nn.LayerNorm(d_model)
         self.conv_module = nn.Sequential(
             nn.Conv1d(d_model, 2 * d_model, kernel_size=1),
@@ -98,7 +90,6 @@ class ConformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Feed-forward 2
         self.ff2 = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, 4 * d_model),
@@ -111,20 +102,16 @@ class ConformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # First feed-forward (half residual)
         x = x + 0.5 * self.ff1(x)
         
-        # Multi-head self-attention
         attn_out = self.attn_norm(x)
         attn_out, _ = self.attn(attn_out, attn_out, attn_out)
         x = x + self.dropout(attn_out)
         
-        # Convolution
         conv_in = self.conv_norm(x).transpose(1, 2)
         conv_out = self.conv_module(conv_in).transpose(1, 2)
         x = x + conv_out
         
-        # Second feed-forward (half residual)
         x = x + 0.5 * self.ff2(x)
         
         return x
@@ -136,7 +123,6 @@ class ConformerVoiceDetector(nn.Module):
         self.d_model = d_model
         self.num_segments = num_segments
         
-        # Multi-resolution encoders
         self.mel_encoder_512 = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=(5, 5), stride=(2, 1), padding=2),
             nn.BatchNorm2d(32),
@@ -163,35 +149,28 @@ class ConformerVoiceDetector(nn.Module):
             nn.MaxPool2d(kernel_size=(2, 2))
         )
         
-        # Calculate fusion size
         self._calculate_fusion_size()
         
-        # Positional encoding
         self.pos_encoding = PositionalEncoding(d_model)
         
-        # Conformer blocks
         self.conformer_blocks = nn.ModuleList([
             ConformerBlock(d_model, n_heads, dropout=0.15) 
             for _ in range(n_conformer_blocks)
         ])
         
-        # Bidirectional GRU
         self.rnn = nn.GRU(
             d_model, rnn_hidden, rnn_layers,
             batch_first=True, bidirectional=True, dropout=0.3
         )
         
-        # Temporal pooling
         self.temporal_pool = TemporalStatisticsPooling(rnn_hidden * 2)
         
-        # Segment attention
         self.segment_attention = nn.Sequential(
             nn.Linear(rnn_hidden * 2, 128),
             nn.Tanh(),
             nn.Linear(128, 1)
         )
         
-        # Classifier
         self.classifier = nn.Sequential(
             nn.Linear(rnn_hidden * 2, 256),
             nn.LeakyReLU(0.3),
@@ -203,7 +182,6 @@ class ConformerVoiceDetector(nn.Module):
         )
 
     def _calculate_fusion_size(self):
-        """Calculate fusion layer size with dummy pass"""
         dummy_mel_512 = torch.randn(1, 1, 64, 100)
         dummy_mel_1024 = torch.randn(1, 1, 128, 100)
         dummy_mfcc = torch.randn(1, 1, 20, 100)
@@ -233,7 +211,6 @@ class ConformerVoiceDetector(nn.Module):
         )
 
     def forward(self, x):
-        # Process all feature types
         mel_512 = self.mel_encoder_512(x['mel_512'])
         mel_512 = mel_512.permute(0, 3, 1, 2).flatten(2)
         
@@ -243,7 +220,6 @@ class ConformerVoiceDetector(nn.Module):
         mfcc = self.mfcc_encoder(x['mfcc'])
         mfcc = mfcc.permute(0, 3, 1, 2).flatten(2)
         
-        # Align temporal dimensions
         min_time = min(mel_512.size(1), mel_1024.size(1), mfcc.size(1))
         
         features = [
@@ -252,18 +228,14 @@ class ConformerVoiceDetector(nn.Module):
             mfcc[:, :min_time, :]
         ]
         
-        # Concatenate and fuse
         x = torch.cat(features, dim=-1)
         x = self.feature_fusion(x)
         
-        # Positional encoding
         x = self.pos_encoding(x)
         
-        # Conformer blocks
         for block in self.conformer_blocks:
             x = block(x)
         
-        # Segment processing
         time_steps = x.size(1)
         segment_size = max(1, time_steps // self.num_segments)
         segments = []

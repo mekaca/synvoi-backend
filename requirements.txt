@@ -1,6 +1,7 @@
 flask==3.0.0
 flask-cors==4.0.0
 gunicorn==21.2.0
-torch==2.6.0
-torchaudio==2.6.0
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+torchaudio==2.6.0+cpu
 numpy>=1.26.0

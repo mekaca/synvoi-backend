@@ -10,12 +10,13 @@ from typing import Optional
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# ---- İsteğe bağlı: PyTorch/Torchaudio runtime ----
-# Build aşamasında torch/torchaudio kuruyorsa import başarır.
-# (Render log'larında 2.6.0+cpu kurulumunu gördük.)
+# PyTorch/Torchaudio imports
 import torch
 import torchaudio
 from torchaudio.functional import resample
+
+# Model imports
+from model import ConformerVoiceDetector, MultiResolutionFeatureExtractor
 
 
 # =========================
@@ -23,7 +24,7 @@ from torchaudio.functional import resample
 # =========================
 APP_NAME = "synvoi-backend"
 
-# Model konumu: ENV varsa onu kullanır; yoksa doğruladığınız asset'a düşer.
+# Model konumu
 MODEL_URL = os.getenv(
     "MODEL_URL",
     "https://github.com/mekaca/synvoi-backend/releases/download/v0.1/demo_model_v3.83.7.pth",
@@ -33,20 +34,20 @@ WEIGHTS_DIR = os.getenv("WEIGHTS_DIR", "/opt/render/project/src/weights").strip(
 MODEL_FILENAME = os.getenv("MODEL_FILENAME", os.path.basename(MODEL_URL)).strip()
 MODEL_LOCAL = os.path.join(WEIGHTS_DIR, MODEL_FILENAME)
 
-# Private GitHub ise PAT girin (public ise boş bırakın)
+# Private GitHub ise PAT girin
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
-# SHA256 doğrulaması (64-hex ise etkin; aksi halde yok sayılır)
+# SHA256 doğrulaması
 RAW_SHA256 = os.getenv("MODEL_SHA256", "").strip()
 MODEL_SHA256 = RAW_SHA256 if re.fullmatch(r"[0-9a-fA-F]{64}", RAW_SHA256 or "") else ""
 
-# İsteğe bağlı kontrol env'leri
+# Kontrol env'leri
 SKIP_MODEL_LOAD = os.getenv("SKIP_MODEL_LOAD", "0").strip() == "1"
 DELAY_MODEL_LOAD = int(os.getenv("DELAY_MODEL_LOAD", "0").strip() or "0")
 
-# API kullanım ayarları
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*").strip()  # örn: https://your-frontend.com
-API_KEY = os.getenv("API_KEY", "").strip()                   # boşsa doğrulama pasif
+# API ayarları
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
 MAX_MB = int(os.getenv("MAX_CONTENT_LENGTH_MB", "20"))
 TARGET_SR = 16000
 
@@ -81,7 +82,6 @@ def _download_with_headers(url: str, dst: str, sha256: Optional[str] = None,
             last_err = e
             time.sleep(min(10, 2 * attempt))
     else:
-        # tüm denemeler başarısız
         raise last_err or RuntimeError("unknown download error")
 
     if sha256:
@@ -103,13 +103,22 @@ def ensure_weights() -> None:
 
 
 # =========================
-# Model yükleme (örnek/placeholder)
+# Model yükleme
 # =========================
 model = None
 model_ready = False
+feature_extractor = None
+
+
+def initialize_feature_extractor():
+    """Feature extractor'ı başlat"""
+    global feature_extractor
+    feature_extractor = MultiResolutionFeatureExtractor(sample_rate=TARGET_SR)
+    print("[bootstrap] Feature extractor başlatıldı")
+
 
 def load_model_safe() -> None:
-    """Model yüklemesini güvenli yap; başarısızsa servis ayakta kalsın."""
+    """Model yüklemesini güvenli yap"""
     global model, model_ready
 
     if SKIP_MODEL_LOAD:
@@ -125,19 +134,46 @@ def load_model_safe() -> None:
     try:
         ensure_weights()
 
-        # Burada gerçek modelinizin yükleyicisini çağırın:
-        # örn:
-        # state = torch.load(MODEL_LOCAL, map_location="cpu")
-        # model = MyModel(...)
-        # model.load_state_dict(state)
-        # model.eval()
-        #
-        # Şimdilik placeholder:
-        model = object()
+        # Gerçek model yükleme
+        print("[bootstrap] Conformer model yükleniyor...")
+        
+        # Model oluştur
+        model = ConformerVoiceDetector(
+            num_classes=2,
+            d_model=384,
+            n_conformer_blocks=6,
+            n_heads=12,
+            num_segments=8,  # Deployment için 8 kullan
+            rnn_hidden=384,
+            rnn_layers=2
+        )
+        
+        # CPU'da çalıştır
+        device = torch.device("cpu")
+        
+        # Checkpoint yükle
+        checkpoint = torch.load(MODEL_LOCAL, map_location=device)
+        
+        # State dict'i yükle
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("[bootstrap] model_state_dict kullanıldı")
+        else:
+            # Eğer doğrudan state_dict ise
+            model.load_state_dict(checkpoint)
+            print("[bootstrap] Doğrudan state_dict yüklendi")
+        
+        model.to(device)
+        model.eval()
+        
         model_ready = True
-        print("[bootstrap] model yüklendi (placeholder)")
+        print("[bootstrap] ✅ Conformer model başarıyla yüklendi")
+        
+        # Feature extractor'ı da başlat
+        initialize_feature_extractor()
+        
     except Exception as e:
-        print(f"[bootstrap] model yükleme hatası: {e}")
+        print(f"[bootstrap] ❌ Model yükleme hatası: {e}")
         model = None
         model_ready = False
 
@@ -152,9 +188,11 @@ def _to_mono_16k(wav: torch.Tensor, sr: int) -> torch.Tensor:
         wav = resample(wav, sr, TARGET_SR)
     return wav
 
+
 def _load_wav_bytes(b: bytes) -> torch.Tensor:
     t, sr = torchaudio.load(io.BytesIO(b))
     return _to_mono_16k(t, sr)
+
 
 def _load_wav_url(url: str) -> torch.Tensor:
     with urllib.request.urlopen(url, timeout=20) as r:
@@ -163,21 +201,66 @@ def _load_wav_url(url: str) -> torch.Tensor:
 
 
 # =========================
-# Inference (örnek)
+# Inference
 # =========================
 @torch.inference_mode()
-def run_inference(_model, wav_16k: torch.Tensor) -> dict:
-    """
-    Buraya kendi feature extractor + model ileri beslemenizi koyun.
-    Şimdilik RMS tabanlı bir dummy skorla dönüyor.
-    """
-    # Normalizasyon + basit RMS
-    x = wav_16k.float()
-    maxv = x.abs().max().clamp_min(1e-6)
-    x = x / maxv
-    score = float(torch.sqrt(torch.mean(x ** 2)))
-    label = "real" if score < 0.02 else "fake"
-    return {"label": label, "score": score}
+def run_inference(model, wav_16k: torch.Tensor) -> dict:
+    """Gerçek Conformer model inference"""
+    
+    # Waveform'u 3 saniyeye ayarla
+    target_length = TARGET_SR * 3  # 3 saniye
+    current_length = wav_16k.shape[-1]
+    
+    # Uzunluk ayarlaması
+    if current_length > target_length:
+        # Ortadan kes
+        start = (current_length - target_length) // 2
+        wav_16k = wav_16k[:, start:start + target_length]
+    elif current_length < target_length:
+        # Padding ekle
+        pad_amount = target_length - current_length
+        pad_left = pad_amount // 2
+        pad_right = pad_amount - pad_left
+        wav_16k = torch.nn.functional.pad(wav_16k, (pad_left, pad_right))
+    
+    # Feature extraction
+    if feature_extractor is None:
+        initialize_feature_extractor()
+    
+    features = feature_extractor(wav_16k)
+    
+    # Normalize features
+    for key in ['mel_512', 'mel_1024', 'mfcc']:
+        if key in features:
+            feat = features[key]
+            mean = feat.mean(dim=(1, 2), keepdim=True)
+            std = feat.std(dim=(1, 2), keepdim=True).clamp(min=1e-5)
+            features[key] = (feat - mean) / std
+    
+    # Batch dimension ekle
+    for key in features:
+        features[key] = features[key].unsqueeze(0)
+    
+    # Model inference
+    output = model(features)
+    
+    # Softmax uygula
+    probs = torch.nn.functional.softmax(output, dim=1)
+    
+    # Sonuçları al
+    fake_prob = probs[0, 1].item()  # Fake class probability
+    real_prob = probs[0, 0].item()  # Real class probability
+    
+    # Karar ver
+    label = "fake" if fake_prob > real_prob else "real"
+    confidence = max(fake_prob, real_prob)
+    
+    return {
+        "label": label,
+        "confidence": round(confidence, 4),
+        "fake_probability": round(fake_prob, 4),
+        "real_probability": round(real_prob, 4)
+    }
 
 
 # =========================
@@ -203,7 +286,7 @@ def root():
         status="ok",
         service=APP_NAME,
         model_ready=model_ready,
-        model_file=os.path.basename(MODEL_LOCAL),
+        model_file=os.path.basename(MODEL_LOCAL) if MODEL_LOCAL else "none",
     ), 200
 
 
@@ -225,6 +308,7 @@ def version():
         skip=SKIP_MODEL_LOAD,
         delay=DELAY_MODEL_LOAD,
         cors_origin=FRONTEND_ORIGIN,
+        model_ready=model_ready,
     ), 200
 
 
@@ -258,8 +342,12 @@ def infer():
         if wav is None:
             return jsonify(error="No audio provided. Use multipart 'file', or JSON 'wav_url'/'wav_base64'."), 400
 
+        # Inference yap
         result = run_inference(model, wav)
+        
+        # Duration hesapla
         dur_s = round(wav.shape[-1] / TARGET_SR, 3)
+        
         return jsonify(
             ok=True,
             **result,
@@ -268,10 +356,14 @@ def infer():
         ), 200
 
     except Exception as e:
+        print(f"[ERROR] Inference failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify(error="inference_failed", detail=str(e)), 500
 
 
 if __name__ == "__main__":
     # Lokal denemelerde de çalışsın
-    load_model_safe()
+    if not model_ready:
+        load_model_safe()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

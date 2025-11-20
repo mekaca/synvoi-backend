@@ -26,11 +26,14 @@ APP_NAME = "synvoi-backend"
 
 MODEL_URL = os.getenv(
     "MODEL_URL",
-    "https://github.com/mekaca/synvoi-backend/releases/download/v0.1/demo_model_v3.83.7.pth",
+    "https://github.com/mekaca/synvoi-backend/releases/download/v0.2/demo_model_v3.83.7_fp16.pth",
 ).strip()
 
-WEIGHTS_DIR = os.getenv("WEIGHTS_DIR", "/opt/render/project/src/weights").strip()
 MODEL_FILENAME = os.getenv("MODEL_FILENAME", os.path.basename(MODEL_URL)).strip()
+
+USE_FP16 = os.getenv("USE_FP16", "1").strip() == "1" 
+
+WEIGHTS_DIR = os.getenv("WEIGHTS_DIR", "/opt/render/project/src/weights").strip()
 MODEL_LOCAL = os.path.join(WEIGHTS_DIR, MODEL_FILENAME)
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
@@ -149,6 +152,12 @@ def load_model_lazy():
             model.load_state_dict(checkpoint)
         
         model.to(device)
+        
+        # FP16 mode
+        if USE_FP16:
+            model.half()
+            print("[INFO] Model running in FP16 mode")
+        
         model.eval()
         
         # Feature extractor
@@ -210,6 +219,11 @@ def run_inference(model, wav_16k: torch.Tensor) -> dict:
     # Feature extraction
     features = feature_extractor(wav_16k)
     
+    # FP16 mode için feature'ları dönüştür
+    if USE_FP16:
+        for key in features:
+            features[key] = features[key].half()
+    
     # Normalize
     for key in ['mel_512', 'mel_1024', 'mfcc']:
         if key in features:
@@ -224,6 +238,10 @@ def run_inference(model, wav_16k: torch.Tensor) -> dict:
     
     # Model inference
     output = model(features)
+    
+    # FP16'dan FP32'ye dönüştür (softmax için)
+    if USE_FP16:
+        output = output.float()
     
     # Softmax
     probs = torch.nn.functional.softmax(output, dim=1)
